@@ -1,0 +1,94 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: kafka-storage-format
+  namespace: bg-dev
+spec:
+  restartPolicy: Never
+  securityContext:
+    runAsUser: 0
+    runAsGroup: 0
+  containers:
+    - name: formatter
+      # use the same image layout as your kafka deployment
+      image: bitnamilegacy/kafka:3.5.0-debian-11-r0
+      imagePullPolicy: IfNotPresent
+      command:
+        - sh
+        - -c
+        - |
+          set -eu
+
+          DATA_DIR="/var/lib/kafka/data"
+          CFG="/opt/bitnami/kafka/config/server.properties"
+          KSTR="/opt/bitnami/kafka/bin/kafka-storage.sh"
+
+          echo "==> DATA_DIR=${DATA_DIR}"
+          echo "==> CFG=${CFG}"
+          echo "==> KSTR=${KSTR}"
+          ls -la /opt || true
+
+          if [ ! -x "$KSTR" ]; then
+            echo "ERROR: kafka-storage.sh NOT FOUND at $KSTR"
+            echo "Listing candidate paths for debugging:"
+            for p in /usr/bin /opt/kafka/bin /opt/bitnami/kafka/bin /bin /usr/local/bin; do
+              echo "--- $p ---"; ls -la "$p" || true
+            done
+            exit 2
+          fi
+
+          echo "Ensuring data dir exists and permissions allow formatting..."
+          mkdir -p "$DATA_DIR"
+          # make world-writable temporarily so format can write meta.properties even if fs owner differs
+          chmod 1777 "$DATA_DIR" || true
+          echo "After mkdir/chmod:"
+          ls -ld "$DATA_DIR"
+
+          echo "Generating cluster id (capture last non-empty line only)..."
+          # capture only the last non-empty output line (in case the tool prints logs before the id)
+          CLUSTER_ID=$($KSTR random-uuid 2>&1 | awk 'NF{line=$0} END{print line}')
+          echo "raw output captured for id: '$CLUSTER_ID'"
+
+          # validate length -- basic sanity check
+          if [ -z "$CLUSTER_ID" ]; then
+            echo "ERROR: cluster id empty"
+            exit 3
+          fi
+
+          echo "Writing .cluster_id"
+          printf '%s\n' "$CLUSTER_ID" > "$DATA_DIR/.cluster_id"
+          chmod 644 "$DATA_DIR/.cluster_id" || true
+          echo ".cluster_id content:"
+          cat "$DATA_DIR/.cluster_id"
+
+          echo "Running kafka-storage.sh format - this will create meta.properties"
+          set -x
+          "$KSTR" format -t "$CLUSTER_ID" -c "$CFG"
+          set +x
+
+          echo "Format command exit status: $?"
+          echo "Listing $DATA_DIR after format:"
+          ls -la "$DATA_DIR" || true
+
+          if [ -f "$DATA_DIR/meta.properties" ]; then
+            echo "meta.properties found. Content:"
+            cat "$DATA_DIR/meta.properties"
+            exit 0
+          else
+            echo "ERROR: meta.properties NOT found. See above output for format failures."
+            exit 4
+          fi
+      volumeMounts:
+        - name: kafka-data
+          mountPath: /var/lib/kafka/data
+        - name: kafka-config
+          mountPath: /opt/bitnami/kafka/config
+          readOnly: true
+  volumes:
+    - name: kafka-data
+      hostPath:
+        path: /home/ubuntu/database/kafka
+        type: DirectoryOrCreate
+    - name: kafka-config
+      configMap:
+        name: kafka-kraft-config
