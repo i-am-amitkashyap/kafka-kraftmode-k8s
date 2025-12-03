@@ -1,0 +1,239 @@
+# kafka-kraft-with-jaas-nodeport.yaml
+# Single-node KRaft with JAAS (PLAIN) and NodePort for external clients (nodePort 30105 -> container 9094)
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kafka-kraft-config
+  namespace: bg-dev
+data:
+  server.properties: |
+    # KRaft single-node config (tuned for SASL_PLAINTEXT external access)
+    process.roles=broker,controller
+    node.id=0
+
+    # listeners: PLAINTEXT for internal, SASL_PLAINTEXT for external clients, CONTROLLER for controller
+    listeners=PLAINTEXT://0.0.0.0:9092,SASL_PLAINTEXT://0.0.0.0:9094,CONTROLLER://0.0.0.0:9093
+    listener.security.protocol.map=PLAINTEXT:PLAINTEXT,SASL_PLAINTEXT:SASL_PLAINTEXT,CONTROLLER:PLAINTEXT
+    controller.listener.names=CONTROLLER
+    controller.quorum.voters=0@0.0.0.0:9093
+
+    # IMPORTANT: advertise external SASL address that clients will use -> Node IP + nodePort
+    # Replace 172.24.1.5 with the node IP you will use externally if different
+    advertised.listeners=PLAINTEXT://kafka.bg-dev.svc.cluster.local:9092,SASL_PLAINTEXT://172.24.1.5:30105
+
+    # storage
+    log.dirs=/var/lib/kafka/data
+
+    offsets.topic.replication.factor=1
+    transaction.state.log.replication.factor=1
+    transaction.state.log.min.isr=1
+
+    # SASL/PLAIN settings
+    sasl.enabled.mechanisms=PLAIN
+    sasl.mechanism.inter.broker.protocol=PLAIN
+    security.inter.broker.protocol=SASL_PLAINTEXT
+
+    # Basic tuning (keep as you had)
+    num.network.threads=3
+    num.io.threads=8
+
+  log4j.properties: |
+    log4j.rootLogger=INFO, stdout
+    log4j.appender.stdout=org.apache.log4j.ConsoleAppender
+    log4j.appender.stdout.layout=org.apache.log4j.PatternLayout
+    log4j.appender.stdout.layout.ConversionPattern=[%d] %p %c - %m%n
+
+  tools-log4j.properties: |
+    log4j.rootLogger=INFO, stdout
+    log4j.appender.stdout=org.apache.log4j.ConsoleAppender
+    log4j.appender.stdout.layout=org.apache.log4j.PatternLayout
+    log4j.appender.stdout.layout.ConversionPattern=[%d] %p %c - %m%n
+
+---
+# Placeholder secret (keep for TLS/other secrets)
+apiVersion: v1
+kind: Secret
+metadata:
+  name: kafka-secrets
+  namespace: bg-dev
+type: Opaque
+stringData:
+  jaas.conf: ""
+  tls.crt: ""
+  tls.key: ""
+
+---
+# JAAS secret: contains the server JAAS config with PLAIN users
+apiVersion: v1
+kind: Secret
+metadata:
+  name: kafka-jaas
+  namespace: bg-dev
+type: Opaque
+stringData:
+  kafka_server_jaas.conf: |
+    KafkaServer {
+        org.apache.kafka.common.security.plain.PlainLoginModule required
+        username="Battlegrid-kafka-admin"
+        password="JaiHind!"
+        user_Battlegrid-kafka-admin="JaiHind!"
+        user_battlegrid-kafka-dev="JaiHind!";
+    };
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kafka-kraft
+  namespace: bg-dev
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kafka-kraft
+  template:
+    metadata:
+      labels:
+        app: kafka-kraft
+    spec:
+      # ensure group permissions for volumes (helps with hostPath)
+      securityContext:
+        fsGroup: 1001
+
+      initContainers:
+      - name: init-kafka-storage
+        image: bitnamilegacy/kafka:3.5.0-debian-11-r0
+        imagePullPolicy: IfNotPresent
+        securityContext:
+          runAsUser: 0
+          runAsGroup: 0
+        command:
+          - sh
+          - -c
+          - |
+            set -e
+            DATA_DIR=/var/lib/kafka/data
+            CFG=/opt/bitnami/kafka/config/server.properties
+
+            if [ -f "${DATA_DIR}/.cluster_id" ]; then
+              echo "cluster id already present: $(cat ${DATA_DIR}/.cluster_id)"
+              exit 0
+            fi
+
+            # location in bitnami image
+            KSTR="/opt/bitnami/kafka/bin/kafka-storage.sh"
+            if [ ! -x "$KSTR" ]; then
+              echo "kafka-storage.sh not found in init image; listing /opt for debugging"
+              ls -la /opt || true
+              exit 1
+            fi
+
+            mkdir -p "${DATA_DIR}"
+            # try to set ownership (may fail on restrictive hostPath, ignore)
+            chown -R 1001:1001 "${DATA_DIR}" || true
+
+            CLUSTER_ID=$($KSTR random-uuid)
+            echo "$CLUSTER_ID" > "${DATA_DIR}/.cluster_id"
+            chmod 644 "${DATA_DIR}/.cluster_id"
+            echo "Formatting storage with clusterId=${CLUSTER_ID}"
+            $KSTR format -t "$CLUSTER_ID" -c "$CFG"
+        volumeMounts:
+          - name: kafka-data
+            mountPath: /var/lib/kafka/data
+          - name: kafka-config
+            mountPath: /opt/bitnami/kafka/config
+            readOnly: true
+          - name: kafka-secrets
+            mountPath: /var/run/kafka/secrets
+            readOnly: true
+          - name: kafka-jaas
+            mountPath: /etc/kafka
+            readOnly: true
+
+      containers:
+      - name: kafka
+        image: bitnamilegacy/kafka:3.5.0-debian-11-r0
+        imagePullPolicy: IfNotPresent
+        securityContext:
+          runAsUser: 1001
+        command:
+          - sh
+          - -c
+          - |
+            exec /opt/bitnami/kafka/bin/kafka-server-start.sh /opt/bitnami/kafka/config/server.properties
+        ports:
+          - containerPort: 9092
+          - containerPort: 9093
+          - containerPort: 9094   # SASL_PLAINTEXT listener
+        resources:
+          requests:
+            cpu: 250m
+            memory: 512Mi
+        env:
+          # load JAAS for SASL/PLAIN
+          - name: KAFKA_OPTS
+            value: -Djava.security.auth.login.config=/etc/kafka/kafka_server_jaas.conf
+          - name: KAFKA_PROCESS_ROLES
+            value: "broker,controller"
+          - name: KAFKA_NODE_ID
+            value: "0"
+          # override listeners from env (keeps parity with server.properties)
+          - name: KAFKA_LISTENERS
+            value: "PLAINTEXT://0.0.0.0:9092,SASL_PLAINTEXT://0.0.0.0:9094,CONTROLLER://0.0.0.0:9093"
+          - name: KAFKA_CONTROLLER_QUORUM_VOTERS
+            value: "0@0.0.0.0:9093"
+          - name: KAFKA_CONTROLLER_LISTENER_NAMES
+            value: "CONTROLLER"
+          - name: KAFKA_LOG_DIRS
+            value: "/var/lib/kafka/data"
+          - name: KAFKA_OPTS_APPEND
+            value: ""  # placeholder, not required
+
+        volumeMounts:
+          - name: kafka-data
+            mountPath: /var/lib/kafka/data
+          - name: kafka-config
+            mountPath: /opt/bitnami/kafka/config
+            readOnly: true
+          - name: kafka-secrets
+            mountPath: /var/run/kafka/secrets
+            readOnly: true
+          - name: kafka-jaas
+            mountPath: /etc/kafka/kafka_server_jaas.conf
+            subPath: kafka_server_jaas.conf
+            readOnly: true
+
+      volumes:
+        - name: kafka-data
+          hostPath:
+            path: /home/ubuntu/database/kafka
+            type: DirectoryOrCreate
+        - name: kafka-config
+          configMap:
+            name: kafka-kraft-config
+        - name: kafka-secrets
+          secret:
+            secretName: kafka-secrets
+        - name: kafka-jaas
+          secret:
+            secretName: kafka-jaas
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafka
+  namespace: bg-dev
+spec:
+  type: NodePort
+  selector:
+    app: kafka-kraft
+  ports:
+    - name: plaintext
+      port: 9092
+      targetPort: 9092
+    - name: sasl
+      port: 9094
+      targetPort: 9094
+      nodePort: 30105
